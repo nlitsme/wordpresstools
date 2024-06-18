@@ -96,9 +96,11 @@ class Wordpress:
                 empty += 1
                 if empty==2:
                     break
-            else:
+            elif type(posts)==list:
                 empty = 0
                 yield from posts
+            else:
+                print(p, "->", posts)
 
             p += 1
 
@@ -182,6 +184,7 @@ def main():
     parser.add_argument('--username', help=argparse.SUPPRESS)
     parser.add_argument('--password', help=argparse.SUPPRESS)
     parser.add_argument('--baseurl', type=str)
+    parser.add_argument('--json', type=str, help='user supplied json-api request')
     parser.add_argument('--sitename', type=str, help='select site from config', default='root')
     args = parser.parse_args()
 
@@ -206,6 +209,9 @@ def main():
         dumpapiinfo(wp.apiinfo())
     if args.rpcinfo:
         dumprpcinfo(wp.rpcinfo().decode())
+    if args.json:
+        res = wp.jsonreq(args.json)
+        print(res)
     if args.posts:
         for p in wp.enuminfo("posts"):
             if args.revisions:
