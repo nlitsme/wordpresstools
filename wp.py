@@ -5,6 +5,7 @@ import http.cookiejar
 import binascii
 import json
 import re
+from browsercookies import addCookiesForHost
 
 def get(d, *path):
     for p in path:
@@ -21,15 +22,19 @@ class Wordpress:
     def __init__(self, args, url):
         self.args = args
         self.baseurl = url
+        self.nonce = None
+        self.cj = http.cookiejar.CookieJar()
+        if args.loadcookies:
+            addCookiesForHost(self.cj, args.loadcookies)
         handlers = []
         if args.trace:
             handlers.append(urllib.request.HTTPSHandler(debuglevel=1))
+        handlers.append(urllib.request.HTTPCookieProcessor(self.cj))
         self.opener = urllib.request.build_opener(*handlers)
 
     def logprint(self, *args):
         if self.args.trace:
             print(*args)
-
 
     def jsonreq(self, path, **query):
         return self.httpreq(self.baseurl + "/wp-json" + path + "?" + urllib.parse.urlencode(query))
@@ -43,7 +48,11 @@ class Wordpress:
 
     def httpreq(self, url, data = None):
         self.logprint(">", url)
-        hdrs = { "User-Agent": "Mozilla/5.0" }
+        hdrs = { "User-Agent": self.args.useragent }
+        if self.nonce:
+            hdrs["X-WP-Nonce"] = self.nonce
+        if self.args.cookie:
+            hdrs["Cookie"] = self.args.cookie
         if data and type(data)==str:
             data = data.encode('utf-8')
         if data and data[:1] in (b'{', b'['):
@@ -64,7 +73,7 @@ class Wordpress:
             response = e
 
         data = response.read()
-        if response.headers.get("content-type", '').find("application/json")>=0:
+        if data and response.headers.get("content-type", '').find("application/json")>=0:
             # note: special handling for sdrplay site which sometimes prefixes json with some html.
             #if m := re.search(br'\[|{\"', data):
             #    data = data[m.start():]
@@ -81,13 +90,13 @@ class Wordpress:
     def rpcinfo(self):
         return self.rpcreq("system.listMethods")
 
-    def enuminfo(self, tp):
+    def enuminfo(self, tp, **kwargs):
         empty = 0
         p = 1
-        ct = 'edit' if self.args.username else 'view'
+        ct = 'edit' if self.args.username or self.nonce else 'view'
 
         while True:
-            posts = self.jsonreq("/wp/v2/"+tp, page=p, per_page=50, context=ct)
+            posts = self.jsonreq("/wp/v2/"+tp, page=p, per_page=50, context=ct, **kwargs)
             if type(posts)==dict:
                 # rest_post_invalid_page_number
                 print(p, "->", posts.get('code'))
@@ -106,17 +115,23 @@ class Wordpress:
 
 
 def dumpapiinfo(api):
+    if type(api) != dict:
+        print(api)
+        return
     for name, info in api.get('routes', {}).items():
         print("%s" % name)
         for ep in info.get('endpoints', []):
             print("  %s" % '.'.join(ep.get('methods', [])))
             alist = ep.get('args') or {}
+            if type(alist)!=dict:
+                print(alist)
+                continue
             for n, a in alist.items():
                 extra = []
                 if a.get('required'):
                     extra.append("required")
                 if a.get('enum'):
-                    extra.append(", ".join(a.get('enum')))
+                    extra.append(", ".join(map(str,a.get('enum'))))
                 extra.append(f"{a.get('minimum', 'None')}..{a.get('maximum', 'None')}, dfl:{a.get('default', 'None')}")
                 print("    %s : %s : %s" % (n, a.get('type'), "\t".join(extra)))
 
@@ -128,7 +143,7 @@ def dumppost(args, p):
         for k, v in p.items():
             print(f"{k:<30}{p.get('id'):>8}\t{v}")
     else:
-        which = "raw" if args.username else "rendered"
+        which = "raw" if args.username or args.usenonce else "rendered"
 
         isrev = p.get('status') is None
 
@@ -180,11 +195,21 @@ def main():
     parser.add_argument('--media', '-m', action='store_true', help='list media')
     parser.add_argument('--apiinfo', '-i', action='store_true', help='print json api info')
     parser.add_argument('--rpcinfo', action='store_true', help='print rpc api info')
+    parser.add_argument('--before', type=str, help='api filter arg')
+    parser.add_argument('--after', type=str, help='api filter arg')
     parser.add_argument('--config', help=argparse.SUPPRESS) # 'specify configuration file.'
     parser.add_argument('--username', help=argparse.SUPPRESS)
     parser.add_argument('--password', help=argparse.SUPPRESS)
+    parser.add_argument('--cookie', help=argparse.SUPPRESS)
+    parser.add_argument('--loadcookies', type=str, help='load browsercookies for domain')
+    parser.add_argument('--useragent', type=str, default='Mozilla/5.0')
+    parser.add_argument('--nonce', help=argparse.SUPPRESS)
+    parser.add_argument('--usenonce', action='store_true')
     parser.add_argument('--baseurl', type=str)
     parser.add_argument('--json', type=str, help='user supplied json-api request')
+    parser.add_argument('--v2', type=str, help='enum /wp/v2/<type> index', metavar='<type>')
+    parser.add_argument('--enum', type=str, help='enum the specified api')
+    parser.add_argument('--rpc', type=str, help='call the specified rpc api')
     parser.add_argument('--sitename', type=str, help='select site from config', default='root')
     args = parser.parse_args()
 
@@ -203,32 +228,56 @@ def main():
     # GET https://siteaddress/wp-json   -> returns api description
     # POST -d '<methodCall><methodName>mt.supportedMethods</methodName></methodCall>' https://siteaddress/xmlrpc.php
 
-    wp = Wordpress(args, args.baseurl)
+    wp = Wordpress(args, args.baseurl.rstrip('/'))
+    if args.usenonce:
+        wp.nonce = wp.httpreq(args.baseurl + "/wp-admin/admin-ajax.php?action=rest-nonce")
 
     if args.apiinfo:
         dumpapiinfo(wp.apiinfo())
     if args.rpcinfo:
         dumprpcinfo(wp.rpcinfo().decode())
     if args.json:
-        res = wp.jsonreq(args.json)
+        #  <req>?arg=val&arg2=val2...
+        if m := re.match(r'(\S+?)(?:\?(\S+))?$', args.json):
+            kv = urllib.parse.parse_qs(m[2])
+            kv = {k:v[0] for k, v in kv.items()}
+            res = wp.jsonreq(m[1], **kv)
+        else:
+            res = wp.jsonreq(args.json)
         print(res)
+    kwargs = dict()
+    if args.before:
+        kwargs["before"] = args.before
+    if args.after:
+        kwargs["after"] = args.after
     if args.posts:
-        for p in wp.enuminfo("posts"):
+        for p in wp.enuminfo("posts", **kwargs):
             if args.revisions:
-                for r in wp.enuminfo(f"posts/{p.get('id')}/revisions"):
+                for r in wp.enuminfo(f"posts/{p.get('id')}/revisions", **kwargs):
                     dumppost(args, r)
             else:
                 dumppost(args, p)
     if args.pages:
-        for p in wp.enuminfo("pages"):
+        for p in wp.enuminfo("pages", **kwargs):
             if args.revisions:
-                for r in wp.enuminfo(f"pages/{p.get('id')}/revisions"):
+                for r in wp.enuminfo(f"pages/{p.get('id')}/revisions", **kwargs):
                     dumppost(args, r)
             else:
                 dumppost(args, p)
     if args.media:
-        for p in wp.enuminfo("media"):
+        for p in wp.enuminfo("media", **kwargs):
             dumpmedia(p)
+    if args.v2:
+        for p in wp.enuminfo(args.v2, **kwargs):
+            print(p)
+
+    if args.enum:
+        for p in wp.enuminfo(args.enum, **kwargs):
+            print(p)
+    if args.rpc:
+        a = args.rpc.split(",")
+        r = wp.rpcreq(*a)
+        print(r.decode())
 
 
 if __name__ == '__main__':
