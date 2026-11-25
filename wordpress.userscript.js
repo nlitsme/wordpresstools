@@ -1,12 +1,13 @@
 // ==UserScript==
 // @name         WordPress REST Browser
 // @namespace    https://example.invalid/
-// @version      1.6
-// @description  Browse WordPress media, files, posts and pages through the REST API
+// @version      1.8
+// @description  Browse WordPress images, videos, files, posts and pages through the REST API
 // @match        http://*/*
 // @match        https://*/*
 // @grant        none
 // ==/UserScript==
+// updated by chatpt GPT-6
 
 (() => {
     'use strict';
@@ -19,25 +20,65 @@
     const GRID_PADDING = 12;
 
     /*
-     * WordPress REST media types other than "image".
+     * Media types kept in Files mode. Images and videos have their
+     * own dedicated tabs.
      */
-    const NON_IMAGE_MEDIA_TYPES = [
+    const FILE_MEDIA_TYPES = [
         'audio',
-        'video',
         'application',
         'text'
     ];
 
 
+    function sameOriginUrl(value) {
+        if (!value)
+            return null;
+
+        try {
+            const url = new URL(value, document.baseURI);
+            if (/^https?:$/.test(url.protocol) && url.origin === location.origin)
+                return url;
+        } catch {
+            // Ignore malformed links in the page.
+        }
+        return null;
+    }
+
+
     function getApiRoot() {
-        const link = document.querySelector(
-            'link[rel="https://api.w.org/"]'
-        );
+        for (const link of document.querySelectorAll('link[rel~="https://api.w.org/"][href]')) {
+            const url = sameOriginUrl(link.getAttribute('href'));
+            if (url)
+                return url;
+        }
 
-        if (link?.href)
-            return link.href;
+        const assets = document.querySelectorAll('script[src], link[rel~="stylesheet"][href]');
+        for (const asset of assets) {
+            const url = sameOriginUrl(asset.getAttribute('src') || asset.getAttribute('href'));
+            const marker = url?.pathname.match(/\/wp-(?:includes|content)\//);
+            if (marker)
+                return new URL(url.pathname.slice(0, marker.index) + '/wp-json/', location.origin);
+        }
 
-        return new URL('/wp-json/', location.origin).href;
+        const generators = document.querySelectorAll('meta[name="generator" i]');
+        for (const generator of generators) {
+            if (/^WordPress(?:\s|$)/i.test(generator.content.trim()))
+                return new URL('/wp-json/', location.origin);
+        }
+
+        return null;
+    }
+
+
+    function collectionUrl(apiRoot, endpoint) {
+        const url = new URL(apiRoot);
+        if (url.searchParams.has('rest_route')) {
+            const root = url.searchParams.get('rest_route').replace(/\/$/, '');
+            url.searchParams.set('rest_route', root + '/' + endpoint);
+        } else {
+            url.pathname = url.pathname.replace(/\/$/, '') + '/' + endpoint;
+        }
+        return url;
     }
 
 
@@ -143,7 +184,7 @@
 
 
 /*
- * Media thumbnails
+ * Image/video thumbnails
  */
 
 #vm-wp-media-grid {
@@ -377,9 +418,6 @@
 
 
     function createUI(apiRoot) {
-        addStyles();
-
-
         /*
          * Explicit UI state.
          *
@@ -388,14 +426,6 @@
          */
         let browserVisible = false;
         let imageViewerVisible = false;
-
-
-        const button = document.createElement('button');
-
-        button.id = 'vm-wp-browser-button';
-        button.textContent = 'WP Browser';
-
-        document.body.appendChild(button);
 
 
         /*
@@ -411,7 +441,8 @@
 
                 <div id="vm-wp-toolbar">
 
-                    <button id="vm-wp-mode-media">Media</button>
+                    <button id="vm-wp-mode-images">Images</button>
+                    <button id="vm-wp-mode-videos">Videos</button>
                     <button id="vm-wp-mode-files">Files</button>
                     <button id="vm-wp-mode-posts">Posts</button>
                     <button id="vm-wp-mode-pages">Pages</button>
@@ -489,8 +520,11 @@
         const status =
             overlay.querySelector('#vm-wp-status');
 
-        const mediaButton =
-            overlay.querySelector('#vm-wp-mode-media');
+        const imagesButton =
+            overlay.querySelector('#vm-wp-mode-images');
+
+        const videosButton =
+            overlay.querySelector('#vm-wp-mode-videos');
 
         const filesButton =
             overlay.querySelector('#vm-wp-mode-files');
@@ -514,7 +548,7 @@
          * State
          */
 
-        let mode = 'media';
+        let mode = 'images';
 
         let page = 1;
         let totalPages = 1;
@@ -566,7 +600,8 @@
                     return 'wp/v2/pages';
 
                 case 'files':
-                case 'media':
+                case 'images':
+                case 'videos':
                 default:
                     return 'wp/v2/media';
             }
@@ -574,9 +609,14 @@
 
 
         function updateModeButtons() {
-            mediaButton.classList.toggle(
+            imagesButton.classList.toggle(
                 'vm-wp-active',
-                mode === 'media'
+                mode === 'images'
+            );
+
+            videosButton.classList.toggle(
+                'vm-wp-active',
+                mode === 'videos'
             );
 
             filesButton.classList.toggle(
@@ -702,7 +742,7 @@
             let total = 0;
 
 
-            for (const mediaType of NON_IMAGE_MEDIA_TYPES) {
+            for (const mediaType of FILE_MEDIA_TYPES) {
                 let remaining =
                     needPerType;
 
@@ -717,9 +757,9 @@
                         );
 
                     const url =
-                        new URL(
-                            'wp/v2/media',
-                            apiRoot
+                        collectionUrl(
+                            apiRoot,
+                            'wp/v2/media'
                         );
 
                     url.searchParams.set(
@@ -877,14 +917,14 @@
             }
 
 
-            if (mode === 'media')
+            if (mode === 'images' || mode === 'videos')
                 calculateMediaGeometry();
 
 
             const url =
-                new URL(
-                    endpointForMode(),
-                    apiRoot
+                collectionUrl(
+                    apiRoot,
+                    endpointForMode()
                 );
 
 
@@ -896,7 +936,7 @@
 
             url.searchParams.set(
                 'per_page',
-                mode === 'media'
+                (mode === 'images' || mode === 'videos')
                     ? mediaPageSize
                     : LIST_PER_PAGE
             );
@@ -922,13 +962,10 @@
             }
 
 
-            if (mode === 'media') {
-                /*
-                 * Only images.
-                 */
+            if (mode === 'images' || mode === 'videos') {
                 url.searchParams.set(
                     'media_type',
-                    'image'
+                    mode === 'images' ? 'image' : 'video'
                 );
 
 
@@ -989,10 +1026,10 @@
                 items.length ? 0 : -1;
 
 
-            if (mode === 'media') {
+            if (mode === 'images' || mode === 'videos') {
                 status.textContent =
                     `page ${page}/${totalPages} — ` +
-                    `${result.total} images — ` +
+                    `${result.total} ${mode} — ` +
                     `${mediaColumns}×${mediaRows}`;
 
             } else {
@@ -1024,8 +1061,11 @@
             }
 
 
-            if (mode === 'media') {
+            if (mode === 'images') {
                 renderMedia();
+
+            } else if (mode === 'videos') {
+                renderVideos();
 
             } else if (mode === 'files') {
                 renderFiles();
@@ -1252,7 +1292,224 @@
 
 
         /*
-         * Non-image media text listing.
+         * Video thumbnails. Video elements use metadata-only preload so
+         * simply opening the browser does not download every full video.
+         */
+
+        function renderVideos() {
+            const grid =
+                document.createElement('div');
+
+            grid.id =
+                'vm-wp-media-grid';
+
+
+            grid.style.gridTemplateColumns =
+                `repeat(${mediaColumns}, minmax(0, 1fr))`;
+
+
+            items.forEach(
+                (item, index) => {
+                    const box =
+                        document.createElement('div');
+
+                    box.className =
+                        'vm-wp-media-item';
+
+                    box.dataset.index =
+                        index;
+
+
+                    if (
+                        index === selectedIndex
+                    ) {
+                        box.classList.add(
+                            'vm-wp-selected'
+                        );
+                    }
+
+
+                    const preview =
+                        document.createElement('video');
+
+                    preview.src =
+                        item.source_url || '';
+
+                    preview.preload =
+                        'metadata';
+
+                    preview.controls =
+                        true;
+
+                    preview.muted =
+                        true;
+
+                    preview.playsInline =
+                        true;
+
+                    preview.style.display =
+                        'block';
+
+                    preview.style.width =
+                        '100%';
+
+                    preview.style.height =
+                        '140px';
+
+                    preview.style.objectFit =
+                        'contain';
+
+                    preview.style.background =
+                        '#111';
+
+
+                    box.appendChild(
+                        preview
+                    );
+
+
+                    const title =
+                        document.createElement(
+                            'div'
+                        );
+
+                    title.className =
+                        'vm-wp-media-title';
+
+                    title.textContent =
+                        item.title?.rendered ||
+                        item.slug ||
+                        `video ${item.id}`;
+
+                    box.appendChild(
+                        title
+                    );
+
+
+                    const info =
+                        document.createElement(
+                            'div'
+                        );
+
+                    info.className =
+                        'vm-wp-media-info';
+
+
+                    const dimensions =
+                        item.media_details?.width &&
+                        item.media_details?.height
+                            ?
+                                ` — ` +
+                                `${item.media_details.width}×` +
+                                `${item.media_details.height}`
+                            :
+                                '';
+
+
+                    info.textContent =
+                        `#${item.id} — ` +
+                        `${item.mime_type || ''}` +
+                        dimensions;
+
+                    box.appendChild(
+                        info
+                    );
+
+
+                    const links =
+                        document.createElement(
+                            'div'
+                        );
+
+                    links.className =
+                        'vm-wp-media-links';
+
+
+                    if (item.source_url) {
+                        const original =
+                            document.createElement(
+                                'a'
+                            );
+
+                        original.href =
+                            item.source_url;
+
+                        original.target =
+                            '_blank';
+
+                        original.rel =
+                            'noopener';
+
+                        original.textContent =
+                            'file';
+
+                        links.appendChild(
+                            original
+                        );
+                    }
+
+
+                    if (item.link) {
+                        const attachment =
+                            document.createElement(
+                                'a'
+                            );
+
+                        attachment.href =
+                            item.link;
+
+                        attachment.target =
+                            '_blank';
+
+                        attachment.rel =
+                            'noopener';
+
+                        attachment.textContent =
+                            'page';
+
+                        links.appendChild(
+                            attachment
+                        );
+                    }
+
+
+                    box.appendChild(
+                        links
+                    );
+
+
+                    box.addEventListener(
+                        'click',
+                        e => {
+                            if (
+                                e.target.closest('a') ||
+                                e.target.tagName === 'VIDEO'
+                            )
+                                return;
+
+                            selectedIndex =
+                                index;
+
+                            updateSelection();
+                        }
+                    );
+
+
+                    grid.appendChild(
+                        box
+                    );
+                }
+            );
+
+
+            content.appendChild(
+                grid
+            );
+        }
+
+
+        /*
+         * Other media/files text listing.
          */
 
         function renderFiles() {
@@ -1537,7 +1794,7 @@
          */
 
         function selectionNodes() {
-            if (mode === 'media') {
+            if (mode === 'images' || mode === 'videos') {
                 return content.querySelectorAll(
                     '.vm-wp-media-item'
                 );
@@ -1568,7 +1825,7 @@
              * Lists may scroll.
              * Media grid is guaranteed to fit.
              */
-            if (mode !== 'media') {
+            if (mode !== 'images' && mode !== 'videos') {
                 const selected =
                     nodes[selectedIndex];
 
@@ -1583,7 +1840,7 @@
 
 
         /*
-         * Media grid cursor movement.
+         * Image/video grid cursor movement.
          */
 
         function moveMediaHorizontal(delta) {
@@ -1695,9 +1952,21 @@
                 items[selectedIndex];
 
 
-            if (mode === 'media') {
+            if (mode === 'images') {
                 if (item.source_url)
                     openImage(selectedIndex);
+
+                return;
+            }
+
+
+            if (mode === 'videos') {
+                if (item.source_url) {
+                    window.open(
+                        item.source_url,
+                        '_blank'
+                    );
+                }
 
                 return;
             }
@@ -1876,41 +2145,45 @@
          * UI controls
          */
 
-        button.addEventListener(
-            'click',
-            async () => {
-                showBrowser();
+        async function openBrowser() {
+            showBrowser();
 
 
-                if (!content.dataset.loaded) {
-                    content.dataset.loaded =
-                        '1';
+            if (!content.dataset.loaded) {
+                content.dataset.loaded =
+                    '1';
 
-                    updateModeButtons();
-
-
-                    /*
-                     * Wait until the browser has a real layout before
-                     * calculating the thumbnail grid.
-                     */
-                    await new Promise(
-                        resolve =>
-                            requestAnimationFrame(
-                                resolve
-                            )
-                    );
+                updateModeButtons();
 
 
-                    load();
-                }
+                /*
+                 * Wait until the browser has a real layout before
+                 * calculating the thumbnail grid.
+                 */
+                await new Promise(
+                    resolve =>
+                        requestAnimationFrame(
+                            resolve
+                        )
+                );
+
+
+                load();
             }
+        }
+
+
+        imagesButton.addEventListener(
+            'click',
+            () =>
+                changeMode('images')
         );
 
 
-        mediaButton.addEventListener(
+        videosButton.addEventListener(
             'click',
             () =>
-                changeMode('media')
+                changeMode('videos')
         );
 
 
@@ -2105,13 +2378,13 @@
 
 
                 /*
-                 * Image thumbnail grid:
+                 * Image/video thumbnail grid:
                  *
                  * Left/Right = previous/next thumbnail
                  * Up/Down    = previous/next visual row
                  * PgUp/PgDn  = previous/next REST page
                  */
-                if (mode === 'media') {
+                if (mode === 'images' || mode === 'videos') {
                     switch (e.key) {
                         case 'ArrowLeft':
 
@@ -2265,19 +2538,55 @@
 
             true
         );
+
+        return openBrowser;
     }
 
 
-    async function main() {
-        const apiRoot =
-            getApiRoot();
+    function main() {
+        const apiRoot = getApiRoot();
+        if (!apiRoot)
+            return;
 
+        addStyles();
 
-        if (await isWordPress(apiRoot))
-            createUI(apiRoot);
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.id = 'vm-wp-browser-button';
+        button.textContent = 'WP Browser';
+        document.body.appendChild(button);
+
+        let openBrowser;
+        button.addEventListener('click', async event => {
+            if (!event.isTrusted)
+                return;
+
+            if (openBrowser) {
+                openBrowser();
+                return;
+            }
+
+            button.disabled = true;
+            button.textContent = 'Checking WordPress API…';
+            try {
+                if (await isWordPress(apiRoot)) {
+                    openBrowser = createUI(apiRoot);
+                    await openBrowser();
+                    button.textContent = 'WP Browser';
+                } else {
+                    button.textContent = 'WP API unavailable · Retry';
+                }
+            } finally {
+                button.disabled = false;
+            }
+        });
     }
 
 
-    main();
+    if (document.readyState === 'loading')
+        document.addEventListener('DOMContentLoaded', main, { once: true });
+    else
+        main();
 
 })();
+
