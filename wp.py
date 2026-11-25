@@ -1,11 +1,16 @@
 #!/usr/bin/python3
+"""
+Inspect a WordPress site's REST and XML-RPC APIs from the command line.
+List posts, pages, media or revisions, or request a specific endpoint.
+Authentication can use HTTP Basic credentials or a browser session.
+"""
+
 import urllib.request
 import urllib.parse
 import http.cookiejar
 import binascii
 import json
 import re
-from browsercookies import addCookiesForHost
 
 def get(d, *path):
     for p in path:
@@ -25,6 +30,7 @@ class Wordpress:
         self.nonce = None
         self.cj = http.cookiejar.CookieJar()
         if args.loadcookies:
+            from browsercookies import addCookiesForHost
             addCookiesForHost(self.cj, args.loadcookies)
         handlers = []
         if args.trace:
