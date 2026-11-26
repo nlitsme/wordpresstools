@@ -1,17 +1,23 @@
-import re
+"""
+Indent WordPress layout from standard input.
+
+WordPress blocks:
+    <!-- wp:tag --> ... <!-- /wp:tag -->
+
+UX Builder shortcodes:
+    [tag] ... [/tag]
+
+Print the indented layout and any WARNING diagnostics to standard output.
+"""
+# updated by chatpt GPT-6
+
+import argparse
 from dataclasses import dataclass
 import json
+import re
+import sys
 
-"""
-wordpress indenter.
 
-std wordpress:
-    <!-- tag --> .. <!-- /tag -->
-
-uxbuilder:
-    [tag] .. [/tag]
-
-"""
 def indent(level): return "  "*level
 
 
@@ -45,6 +51,8 @@ class TokenBase:
     """
     def __init__(self):
         self.children = []
+        self.source = None
+        self.endtoken = None
 
     def addChild(self, elem):
         if self.children and isinstance(self.children[-1], BodyToken) and isinstance(elem, BodyToken):
@@ -53,6 +61,8 @@ class TokenBase:
             self.children.append(elem)
 
     def astag(self):
+        if self.source is not None:
+            return self.source
         if self.isend:
             return self.asendtag()
         elif self.issingle:
@@ -62,34 +72,35 @@ class TokenBase:
 
     def oneline(self):
         """
-        output this and all children as one line.
+        Render this token and its children with their original spacing.
         """
-        if self.children:
-            ch = "".join(_.oneline() for _ in self.children)
-            return f"{self.asstarttag()}{ch}{self.asendtag()}"
-        else:
-            return f"{self.assingletag()}"
+        children = "".join(child.oneline() for child in self.children)
+        endtag = self.endtoken.astag() if self.endtoken else ""
+        return self.astag() + children + endtag
 
     def multiline(self, level):
         """
-        find the best
+        Find the best layout without rewriting text or tag contents.
         """
-        if self.children:
-            ch_m = "".join(_.multiline(level+1) for _ in self.children)
-            ch_o = "".join(_.oneline() for _ in self.children)
-            txt_o = f"{self.asstarttag()}{ch_o}{self.asendtag()}"
-            if len(txt_o) < 160:
-                return indent(level) + txt_o + "\n"
-            if len(ch_o) < 160:
-                return indent(level) + f"{self.asstarttag()}\n" + \
-                       indent(level+1) + ch_o + "\n" + \
-                       indent(level) + f"{self.asendtag()}\n"
-            else:
-                return indent(level) + f"{self.asstarttag()}\n" + \
-                       ch_m + \
-                       indent(level) + f"{self.asendtag()}\n"
-        else:
-            return indent(level) + f"{self.assingletag()}\n"
+        prefix = indent(level)
+        text = self.oneline()
+        if not self.endtoken or not self.children:
+            return prefix + text + "\n"
+        if "\n" not in text and len(prefix) + len(text) < 160:
+            return prefix + text + "\n"
+        children = []
+        for child in self.children:
+            if not isinstance(child, BodyToken):
+                children.append(child)
+            elif child.body.strip():
+                return prefix + text + "\n"
+        if not children:
+            return prefix + text + "\n"
+
+        newline = "\r\n" if "\r\n" in text else "\n"
+        body = newline.join(child.multiline(level + 1)[:-1] for child in children)
+        lines = (prefix + self.astag(), body, prefix + self.endtoken.astag())
+        return newline.join(lines) + "\n"
 
 
 @dataclass
@@ -100,14 +111,13 @@ class BodyToken:
     body : str
 
     def merge(self, elem):
-        # join two Txt elements with a space
-        self.body = self.body + " " + elem.body
+        self.body += elem.body
 
     def oneline(self):
-        return stripspaces(self.body)
+        return self.body
 
     def multiline(self, level):
-        return indent(level) + self.oneline()+"\n"
+        return self.body
 
 @dataclass
 class WordpressToken(TokenBase):
@@ -152,6 +162,7 @@ class UXBuilderToken(TokenBase):
 
     def __post_init__(self):
         super().__init__()
+        self.explicit_single = False
         notsingle = {
             'accordion-item', 'accordion', 'col', 'col_inner', 'featured_box', 'row',
             'row_inner', 'section', 'tab', 'tabgroup', 'ux_html', 'ux_image_box',
@@ -185,11 +196,28 @@ class Root:
         self.children = []
 
     def addChild(self, elem):
-        self.children.append(elem)
+        if self.children and isinstance(self.children[-1], BodyToken) and isinstance(elem, BodyToken):
+            self.children[-1].merge(elem)
+        else:
+            self.children.append(elem)
 
     def printindented(self):
-        for e in self.children:
-            print(e.multiline(0))
+        for index, elem in enumerate(self.children):
+            if isinstance(elem, BodyToken) or self.has_inline_body(index):
+                sys.stdout.write(elem.oneline())
+            else:
+                sys.stdout.write(elem.multiline(0)[:-1])
+
+    def has_inline_body(self, index):
+        if index > 0:
+            previous = self.children[index - 1]
+            if isinstance(previous, BodyToken) and previous.body.rsplit("\n", 1)[-1].strip():
+                return True
+        if index + 1 < len(self.children):
+            following = self.children[index + 1]
+            if isinstance(following, BodyToken) and following.body.split("\n", 1)[0].strip():
+                return True
+        return False
 
 
 def kv_decoder(text):
@@ -197,51 +225,116 @@ def kv_decoder(text):
     decodes a key=value attribute list into a dictionary.
     """
     attr = []
-    paramregex = re.compile(r' (\w+)=\"([^"]*)\"')
+    paramregex = re.compile(r"""\s+([\w-]+)\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"']+))""")
     pos = 0
     while True:
         m = paramregex.search(text, pos)
         if not m:
             break
         if pos < m.start():
-            print("WARNING: unexpected: '%s'" % text[pos:m.start()])
-        attr.append((m[1], m[2]))
+            print(f"WARNING: unexpected attributes: {text[pos:m.start()]!r}")
+        attr.append((m[1], next(group for group in m.groups()[1:] if group is not None)))
         pos = m.end()
     if pos < len(text):
-        print("WARNING: unexpected: '%s'" % text[pos:])
+        print(f"WARNING: unexpected attributes: {text[pos:]!r}")
     return dict(attr)
+
+
+QUOTED = r"""(?:"[^"]*"|'[^']*')"""
+BLOCK_TAG = re.compile(r'<!--\s*(/)?(wp:[\w-]+(?:/[\w-]+)?)(?=\s|/|-->)(.*?)-->', re.DOTALL)
+MARKUP = re.compile(
+    rf"""<!--.*?(?:-->|\Z)|
+        <(?P<verbatim>pre|code|script|style|textarea)(?=[\s/>])(?:{QUOTED}|[^>"'])*>.*?(?:</(?P=verbatim)\s*>|\Z)|
+        </?[a-z][\w:-]*(?=[\s/>])(?:{QUOTED}|[^>"'])*>|
+        (?<!\[)(?P<escaped>\[)?\[(/)?(?P<shortcode>[\w-]+)(?=[\s/\]])(?P<attrs>(?:{QUOTED}|[^\[\]"'])*)\]
+    """,
+    re.IGNORECASE | re.DOTALL | re.VERBOSE,
+)
+
+
+def wordpress_tag(source):
+    match = BLOCK_TAG.fullmatch(source)
+    if not match:
+        return None
+
+    isend = bool(match[1])
+    attrs = match[3].strip()
+    issingle = attrs.endswith('/')
+    if issingle:
+        attrs = attrs[:-1].rstrip()
+
+    try:
+        params = json.loads(attrs) if attrs else None
+        if (attrs and not isinstance(params, dict)) or (isend and (attrs or issingle)):
+            raise ValueError("invalid block attributes")
+    except (ValueError, RecursionError) as error:
+        print(f"WARNING: {match[2]}: {error}")
+        return None
+    return WordpressToken(isend, issingle, match[2], params)
+
+
+def uxbuilder_tag(match):
+    name = match['shortcode']
+    attrs = match['attrs']
+    isend = match[0].startswith('[/')
+    issingle = attrs.rstrip().endswith('/')
+    if issingle:
+        attrs = attrs.rstrip()[:-1]
+    if isend and (attrs.strip() or issingle):
+        return None
+    token = UXBuilderToken(isend, name, kv_decoder(attrs.rstrip()))
+    if issingle:
+        token.issingle = True
+    token.explicit_single = issingle
+    return token
+
+
+def escaped_shortcode_end(text, match):
+    end = match.end()
+    if text.startswith(']', end):
+        return end + 1
+
+    name = re.escape(match['shortcode'])
+    closer = re.compile(rf'\[/{name}\s*\]\]').search(text, end)
+    return closer.end() if closer else end
 
 
 def wordpress_tokenizer(text):
     """
     split wordpress text into tokens.
     """
-    # 1=/, 2=tag, 3=params, 4=/
-    wpregex = re.compile(r'<!-- (/)?(\S+)(?: (\{.*?\}))? (/)?-->')
-
-    # 1=/, 2=tag, 3=params
-    uxregex = re.compile(r'\[(/)?(\w+)((?: \w+=\"[^"]*\")*)\]')
     pos = 0
-    while True:
-        mwp = wpregex.search(text, pos)
-        mux = uxregex.search(text, pos)
-        if mwp and (not mux or mwp.start() < mux.start()):
-            if pos < mwp.start():
-                yield BodyToken(text[pos:mwp.start()])
-            params = json.loads(mwp[3]) if mwp[3] else None
-                
-            yield WordpressToken(mwp[1]=='/', mwp[4]=='/', mwp[2], params)
-            pos = mwp.end()
-        elif mux and (not mwp or mux.start() < mwp.start()):
-            if pos < mux.start():
-                yield BodyToken(text[pos:mux.start()])
-            params = kv_decoder(mux[3])
-            yield UXBuilderToken(mux[1]=='/', mux[2], params)
-            pos = mux.end()
-        else:
-            yield BodyToken(text[pos:])
+    body_start = 0
+    while match := MARKUP.search(text, pos):
+        pos = match.end()
+        if match['escaped']:
+            pos = escaped_shortcode_end(text, match)
+            continue
 
-            break
+        token = uxbuilder_tag(match) if match['shortcode'] else wordpress_tag(match[0])
+        if token is None:
+            continue
+        if body_start < match.start():
+            yield BodyToken(text[body_start:match.start()])
+        token.source = match[0]
+        yield token
+        body_start = pos
+
+    if body_start < len(text):
+        yield BodyToken(text[body_start:])
+
+
+def close_token(stack, token):
+    for index in range(len(stack) - 1, 0, -1):
+        opener = stack[index]
+        if type(opener) is type(token) and opener.tag == token.tag:
+            for child in stack[index + 1:]:
+                print(f"WARNING: missing end tag for {child.tag} before closing {token.tag}")
+            opener.endtoken = token
+            del stack[index:]
+            return
+    print(f"WARNING: no start tag for {token.tag}")
+    stack[-1].addChild(BodyToken(token.astag()))
 
 
 def wpparser(text):
@@ -249,44 +342,44 @@ def wpparser(text):
     decodes wordpress text into a tree of tokens.
     """
     stack = [Root()]
-    for token in wordpress_tokenizer(text):
+    tokens = list(wordpress_tokenizer(text))
+    # An explicit closing tag also identifies containers outside the UX Builder list.
+    paired_shortcodes = {token.tag for token in tokens if isinstance(token, UXBuilderToken) and token.isend}
+    for token in tokens:
         if isinstance(token, BodyToken):
             stack[-1].addChild(token)
+        elif token.isend:
+            close_token(stack, token)
         else:
-            if token.issingle:
-                stack[-1].addChild(token)
-            elif token.isend:
-                if stack[-1].tag == token.tag:
-                    stack.pop()
-                else:
-                    for i, e in reversed(list(enumerate(stack))):
-                        if e.tag==token.tag:
-                            print("WARNING: missing end tag for: %s closing %s" % ( stack[i+1:], stack[i:i+1]))
-                            while len(stack)>i:
-                                stack.pop()
-                            break
-                    print("WARNING: could not find start tag for: %s in %s" % (token.tag, stack))
-            else:
-                stack[-1].addChild(token)
+            if isinstance(token, UXBuilderToken) and token.tag in paired_shortcodes and not token.explicit_single:
+                token.issingle = False
+            stack[-1].addChild(token)
+            if not token.issingle:
                 stack.append(token)
-    if len(stack)>1:
-        print("WARNING: Too many stack items")
-        for e in stack[1:]:
-            print("**", e)
+    for token in stack[1:]:
+        print(f"WARNING: missing end tag for {token.tag} at end of input")
 
     return stack[0]
 
 
-def main():
-    import argparse
-    parser = argparse.ArgumentParser(description='wordpress indent tool')
-    args = parser.parse_args()
+class ArgumentParser(argparse.ArgumentParser):
+    def error(self, message):
+        print(f"ERROR: {message}")
+        raise SystemExit(2)
 
-    import sys
-    text = sys.stdin.read()
+
+def main():
+    parser = ArgumentParser(description='wordpress indent tool')
+    parser.parse_args()
+    try:
+        text = sys.stdin.buffer.read().decode('utf-8')
+    except (OSError, UnicodeError) as error:
+        print(f"ERROR: standard input: {error}")
+        return 1
     tree = wpparser(text)
     tree.printindented()
+    return 0
 
 if __name__ == '__main__':
-    main()
+    raise SystemExit(main())
 
